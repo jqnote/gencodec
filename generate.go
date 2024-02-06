@@ -47,10 +47,11 @@ func writeFunction(w io.Writer, fs *token.FileSet, fn Function) {
 // genUnmarshalJSON generates the UnmarshalJSON method.
 func genUnmarshalJSON(mtyp *marshalerType) Function {
 	var (
+		format   = "json"
 		m        = newMarshalMethod(mtyp, true)
 		recv     = m.receiver()
 		input    = Name(m.scope.newIdent("input"))
-		intertyp = m.intermediateType(m.scope.newIdent(m.mtyp.orig.Obj().Name()))
+		intertyp = m.intermediateType(m.scope.newIdent(m.mtyp.orig.Obj().Name()), format)
 		dec      = Name(m.scope.newIdent("dec"))
 		json     = Name(m.scope.parent.packageName("encoding/json"))
 	)
@@ -68,7 +69,7 @@ func genUnmarshalJSON(mtyp *marshalerType) Function {
 			}),
 		},
 	}
-	fn.Body = append(fn.Body, m.unmarshalConversions(dec, Name(recv.Name), "json")...)
+	fn.Body = append(fn.Body, m.unmarshalConversions(dec, Name(recv.Name), format)...)
 	fn.Body = append(fn.Body, Return{Values: []Expression{NIL}})
 	return fn
 }
@@ -76,9 +77,10 @@ func genUnmarshalJSON(mtyp *marshalerType) Function {
 // genMarshalJSON generates the MarshalJSON method.
 func genMarshalJSON(mtyp *marshalerType) Function {
 	var (
+		format   = "json"
 		m        = newMarshalMethod(mtyp, false)
 		recv     = m.receiver()
-		intertyp = m.intermediateType(m.scope.newIdent(m.mtyp.orig.Obj().Name()))
+		intertyp = m.intermediateType(m.scope.newIdent(m.mtyp.orig.Obj().Name()), format)
 		enc      = Name(m.scope.newIdent("enc"))
 		json     = Name(m.scope.parent.packageName("encoding/json"))
 	)
@@ -91,7 +93,7 @@ func genMarshalJSON(mtyp *marshalerType) Function {
 			Declare{Name: enc.Name, TypeName: intertyp.Name},
 		},
 	}
-	fn.Body = append(fn.Body, m.marshalConversions(Name(recv.Name), enc, "json")...)
+	fn.Body = append(fn.Body, m.marshalConversions(Name(recv.Name), enc, format)...)
 	fn.Body = append(fn.Body, Return{Values: []Expression{
 		CallFunction{
 			Func:   Dotted{Receiver: json, Name: "Marshal"},
@@ -113,12 +115,12 @@ func genUnmarshalTOML(mtyp *marshalerType) Function {
 
 func genUnmarshalLikeYAML(mtyp *marshalerType, name string) Function {
 	var (
+		tag       = strings.ToLower(name)
 		m         = newMarshalMethod(mtyp, true)
 		recv      = m.receiver()
 		unmarshal = Name(m.scope.newIdent("unmarshal"))
-		intertyp  = m.intermediateType(m.scope.newIdent(m.mtyp.orig.Obj().Name()))
+		intertyp  = m.intermediateType(m.scope.newIdent(m.mtyp.orig.Obj().Name()), tag)
 		dec       = Name(m.scope.newIdent("dec"))
-		tag       = strings.ToLower(name)
 	)
 	fn := Function{
 		Receiver:    recv,
@@ -148,11 +150,11 @@ func genMarshalTOML(mtyp *marshalerType) Function {
 
 func genMarshalLikeYAML(mtyp *marshalerType, name string) Function {
 	var (
+		tag      = strings.ToLower(name)
 		m        = newMarshalMethod(mtyp, false)
 		recv     = m.receiver()
-		intertyp = m.intermediateType(m.scope.newIdent(m.mtyp.orig.Obj().Name()))
+		intertyp = m.intermediateType(m.scope.newIdent(m.mtyp.orig.Obj().Name()), tag)
 		enc      = Name(m.scope.newIdent("enc"))
-		tag      = strings.ToLower(name)
 	)
 	fn := Function{
 		Receiver:    recv,
@@ -177,7 +179,7 @@ func (m *marshalMethod) receiver() Receiver {
 	return r
 }
 
-func (m *marshalMethod) intermediateType(name string) Struct {
+func (m *marshalMethod) intermediateType(name, format string) Struct {
 	s := Struct{Name: name}
 	for _, f := range m.mtyp.Fields {
 		if m.isUnmarshal && f.function != nil {
@@ -187,8 +189,9 @@ func (m *marshalMethod) intermediateType(name string) Struct {
 		if m.isUnmarshal {
 			typ = ensureNilCheckable(typ)
 		}
+		intermediateName := f.encodeIntermediateName(format)
 		s.Fields = append(s.Fields, Field{
-			Name:     f.name,
+			Name:     intermediateName,
 			TypeName: types.TypeString(typ, m.mtyp.scope.qualify),
 			Tag:      f.tag,
 		})
@@ -203,7 +206,8 @@ func (m *marshalMethod) unmarshalConversions(from, to Var, format string) (s []S
 		}
 
 		fieldName := f.encodedName(format)
-		accessFrom := Dotted{Receiver: from, Name: f.name}
+		intermediateFieldName := f.encodeIntermediateName(format)
+		accessFrom := Dotted{Receiver: from, Name: intermediateFieldName}
 		accessTo := Dotted{Receiver: to, Name: f.name}
 		typ := ensureNilCheckable(f.typ)
 		if !f.isRequired(format) {
@@ -232,7 +236,8 @@ func (m *marshalMethod) unmarshalConversions(from, to Var, format string) (s []S
 func (m *marshalMethod) marshalConversions(from, to Var, fieldName string) (s []Statement) {
 	for _, f := range m.mtyp.Fields {
 		accessFrom := Dotted{Receiver: from, Name: f.name}
-		accessTo := Dotted{Receiver: to, Name: f.name}
+		intermediateFieldName := f.encodeIntermediateName(fieldName)
+		accessTo := Dotted{Receiver: to, Name: intermediateFieldName}
 		var value Expression = accessFrom
 		if f.function != nil {
 			value = CallFunction{Func: accessFrom}
@@ -422,4 +427,15 @@ func convertSimple(from Expression, fromtyp, totyp types.Type, qf types.Qualifie
 
 func invalidConv(from, to types.Type, qf types.Qualifier) {
 	panic(fmt.Errorf("BUG: invalid conversion %s -> %s", types.TypeString(from, qf), types.TypeString(to, qf)))
+}
+
+func toCamelCase(s string, delimiter string) string {
+	words := strings.Split(s, delimiter)
+	var camelCaseString string
+
+	for _, word := range words {
+		camelCaseString += strings.Title(word)
+	}
+
+	return camelCaseString
 }

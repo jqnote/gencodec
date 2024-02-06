@@ -151,6 +151,7 @@ func main() {
 		typename  = flag.String("type", "", "type to generate methods for")
 		overrides = flag.String("field-override", "", "type to take field type replacements from")
 		formats   = flag.String("formats", "json", `marshaling formats (e.g. "json,yaml")`)
+		immutable = flag.Bool("immutable", false, "")
 	)
 	flag.Parse()
 
@@ -158,7 +159,7 @@ func main() {
 	for i := range formatList {
 		formatList[i] = strings.TrimSpace(formatList[i])
 	}
-	cfg := Config{Dir: *pkgdir, Type: *typename, FieldOverride: *overrides, Formats: formatList}
+	cfg := Config{Dir: *pkgdir, Type: *typename, FieldOverride: *overrides, Formats: formatList, Immutable: *immutable}
 	code, err := cfg.process()
 	if err != nil {
 		fatal(err)
@@ -184,6 +185,7 @@ type Config struct {
 	Formats       []string // defaults to just "json", supported: "json", "yaml"
 	Importer      types.Importer
 	FileSet       *token.FileSet
+	Immutable     bool
 }
 
 func (cfg *Config) process() (code []byte, err error) {
@@ -206,7 +208,7 @@ func (cfg *Config) process() (code []byte, err error) {
 	}
 
 	// Construct the marshaling type.
-	mtyp := newMarshalerType(cfg.FileSet, cfg.Importer, typ)
+	mtyp := newMarshalerType(cfg.FileSet, cfg.Importer, cfg.Immutable, typ)
 	if cfg.FieldOverride != "" {
 		otyp, err := lookupStructType(pkg.Scope(), cfg.FieldOverride)
 		if err != nil {
@@ -259,6 +261,9 @@ func generate(mtyp *marshalerType, cfg *Config) ([]byte, error) {
 	if mtyp.override != nil {
 		writeUseOfOverride(w, mtyp.override, mtyp.scope.qualify)
 	}
+
+	genGetters(w, mtyp)
+
 	for _, format := range cfg.Formats {
 		var genMarshal, genUnmarshal gogen.Function
 		switch format {
@@ -286,6 +291,33 @@ func generate(mtyp *marshalerType, cfg *Config) ([]byte, error) {
 	return w.Bytes(), nil
 }
 
+func genGetters(w *bytes.Buffer, mtyp *marshalerType) {
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "// getters")
+	fmt.Fprintln(w)
+	var (
+		m    = newMarshalMethod(mtyp, false)
+		recv = m.receiver()
+	)
+
+	for _, f := range mtyp.Fields {
+		typ := f.typ
+		intermediateName := f.encodeIntermediateName("json")
+		typeName := types.TypeString(typ, m.mtyp.scope.qualify)
+		fn := gogen.Function{
+			Receiver:    recv,
+			Name:        "Get" + intermediateName,
+			ReturnTypes: gogen.Types{{TypeName: typeName}},
+			Body: []gogen.Statement{
+				gogen.Return{Values: []gogen.Expression{gogen.Dotted{Receiver: gogen.Var{Name: recv.Name}, Name: f.name}}},
+			},
+		}
+		fmt.Fprintln(w)
+		writeFunction(w, mtyp.fs, fn)
+	}
+	fmt.Fprintln(w)
+}
+
 func writeUseOfOverride(w io.Writer, n *types.Named, qf types.Qualifier) {
 	name := types.TypeString(types.NewPointer(n), qf)
 	fmt.Fprintf(w, "var _ = (%s)(nil)\n", name)
@@ -294,25 +326,28 @@ func writeUseOfOverride(w io.Writer, n *types.Named, qf types.Qualifier) {
 // marshalerType represents the intermediate struct type used during marshaling.
 // This is the input data to all the Go code templates.
 type marshalerType struct {
-	name     string
-	Fields   []*marshalerField
-	fs       *token.FileSet
-	orig     *types.Named
-	override *types.Named
-	scope    *fileScope
+	name      string
+	Fields    []*marshalerField
+	fs        *token.FileSet
+	orig      *types.Named
+	override  *types.Named
+	scope     *fileScope
+	immutable bool
 }
 
 // marshalerField represents a field of the intermediate marshaling type.
 type marshalerField struct {
-	name     string
-	typ      types.Type
-	origTyp  types.Type
-	tag      string
-	function *types.Func // map to a function instead of a field
+	name      string
+	typ       types.Type
+	origTyp   types.Type
+	tag       string
+	function  *types.Func // map to a function instead of a field
+	immutable bool
+	exported  bool
 }
 
-func newMarshalerType(fs *token.FileSet, imp types.Importer, typ *types.Named) *marshalerType {
-	mtyp := &marshalerType{name: typ.Obj().Name(), fs: fs, orig: typ}
+func newMarshalerType(fs *token.FileSet, imp types.Importer, immutable bool, typ *types.Named) *marshalerType {
+	mtyp := &marshalerType{name: typ.Obj().Name(), fs: fs, orig: typ, immutable: immutable}
 	styp := typ.Underlying().(*types.Struct)
 	mtyp.scope = newFileScope(imp, typ.Obj().Pkg())
 	mtyp.scope.addReferences(styp)
@@ -323,19 +358,28 @@ func newMarshalerType(fs *token.FileSet, imp types.Importer, typ *types.Named) *
 
 	for i := 0; i < styp.NumFields(); i++ {
 		f := styp.Field(i)
-		if !f.Exported() {
-			continue
+		if immutable {
+			if f.Exported() {
+				panic(fmt.Errorf("warning: exported field %s not supported", f.Name()))
+			}
+		} else {
+			if !f.Exported() {
+				continue
+			}
 		}
+
 		if f.Anonymous() {
 			fmt.Fprintf(os.Stderr, "Warning: ignoring embedded field %s\n", f.Name())
 			continue
 		}
 
 		mf := &marshalerField{
-			name:    f.Name(),
-			typ:     f.Type(),
-			origTyp: f.Type(),
-			tag:     styp.Tag(i),
+			name:      f.Name(),
+			typ:       f.Type(),
+			origTyp:   f.Type(),
+			tag:       styp.Tag(i),
+			immutable: true,
+			exported:  f.Exported(),
 		}
 
 		mtyp.Fields = append(mtyp.Fields, mf)
@@ -420,6 +464,13 @@ func (mf *marshalerField) encodedName(format string) string {
 		return uncapitalize(mf.name)
 	}
 	return val
+}
+
+func (mf *marshalerField) encodeIntermediateName(format string) string {
+	if mf.immutable {
+		return toCamelCase(mf.encodedName(format), "_")
+	}
+	return mf.encodedName(format)
 }
 
 func uncapitalize(s string) string {
